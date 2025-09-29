@@ -1,0 +1,26 @@
+# .gitignore for Gradle Java project
+build/
+.idea/
+*.iml
+.gradle/
+*.log
+*.class
+out/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# VSCode
+.vscode/
+
+# 기타
+*.swp
+*.swo
+
+#bin
+bin/
+
+# log
+log/
+logs/

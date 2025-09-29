@@ -1,0 +1,37 @@
+plugins {
+    id 'java'
+    id 'application'
+    id 'com.github.johnrengelman.shadow' version '7.1.2'
+}
+
+group = 'app'
+version = '1.0.0'
+sourceCompatibility = JavaVersion.VERSION_1_8
+targetCompatibility = JavaVersion.VERSION_1_8
+
+application {
+    mainClass = 'app.Main'
+}
+
+repositories { mavenCentral() }
+
+dependencies {
+    implementation 'io.netty:netty-all:4.1.108.Final'
+    implementation 'ch.qos.logback:logback-classic:1.2.13'
+}
+
+tasks.withType(JavaCompile) {
+    options.encoding = 'UTF-8'
+}
+
+tasks.named('shadowJar') {
+    archiveBaseName.set('rate-limit')
+    archiveClassifier.set('')
+    archiveVersion.set(version)
+}
+
+jar {
+    manifest {
+        attributes 'Main-Class': 'app.Main'
+    }
+}
