@@ -5,6 +5,12 @@
 curl -i http://localhost:18089/health
 ```
 
+# 로컬에서 metric 요청
+curl -s http://localhost:18089/metrics | head -50
+
+# metric 요청 : 원하면 포맷 명시
+curl -s -H 'Accept: text/plain; version=0.0.4' http://localhost:18089/metrics | head
+
 ## 기본 API (비용 1)
 ```shell
 curl -i -H 'X-User-Id: alice' http://localhost:18089/api/hello

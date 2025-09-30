@@ -8,48 +8,67 @@
 
     <!-- 콘솔 (개발용) -->
     <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
-    <encoder>
-        <pattern>${LOGLINE_PATTERN}</pattern>
-        <charset>UTF-8</charset>
-    </encoder>
+        <encoder>
+            <pattern>${LOGLINE_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
     </appender>
 
     <!-- ✅ 애플리케이션 로그: 날짜+용량 기준 롤링, gz 압축, 14일 보존, 총 용량 2GB -->
     <appender name="APP_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
-    <file>${LOG_DIR}/${APP_NAME}.log</file>
-    <encoder>
-        <pattern>${LOGLINE_PATTERN}</pattern>
-        <charset>UTF-8</charset>
-    </encoder>
+        <file>${LOG_DIR}/${APP_NAME}.log</file>
+        <encoder>
+            <pattern>${LOGLINE_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
 
-    <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
-        <!-- 일 단위 파일명 + 인덱스(용량) + gz 압축 -->
-        <fileNamePattern>${LOG_DIR}/archive/%d{yyyy-MM,UTC}/${APP_NAME}.%d{yyyy-MM-dd}.%i.log.gz</fileNamePattern>
-        <maxHistory>14</maxHistory>                <!-- 14일 보존 -->
-        <totalSizeCap>2GB</totalSizeCap>           <!-- 전체 보관 용량 상한 -->
-        <cleanHistoryOnStart>true</cleanHistoryOnStart>
+        <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+            <!-- 일 단위 파일명 + 인덱스(용량) + gz 압축 -->
+            <fileNamePattern>${LOG_DIR}/archive/%d{yyyy-MM,UTC}/${APP_NAME}.%d{yyyy-MM-dd}.%i.log.gz</fileNamePattern>
+            <maxHistory>14</maxHistory>                <!-- 14일 보존 -->
+            <totalSizeCap>2GB</totalSizeCap>           <!-- 전체 보관 용량 상한 -->
+            <cleanHistoryOnStart>true</cleanHistoryOnStart>
 
-        <!-- 용량 기준 세분화(하루 파일이 100MB 넘으면 .1, .2 ...로 분할) -->
-        <timeBasedFileNamingAndTriggeringPolicy
-            class="ch.qos.logback.core.rolling.SizeAndTimeBasedFNATP">
-        <maxFileSize>100MB</maxFileSize>
-        </timeBasedFileNamingAndTriggeringPolicy>
-    </rollingPolicy>
+            <!-- 용량 기준 세분화(하루 파일이 100MB 넘으면 .1, .2 ...로 분할) -->
+            <timeBasedFileNamingAndTriggeringPolicy
+                class="ch.qos.logback.core.rolling.SizeAndTimeBasedFNATP">
+            <maxFileSize>100MB</maxFileSize>
+            </timeBasedFileNamingAndTriggeringPolicy>
+        </rollingPolicy>
     </appender>
 
     <!-- ✅ 액세스/레이트 이벤트 등 고빈도 로그는 비동기 처리로 지연 최소화 -->
     <appender name="ASYNC_APP_FILE" class="ch.qos.logback.classic.AsyncAppender">
-    <appender-ref ref="APP_FILE"/>
-    <discardingThreshold>0</discardingThreshold>
-    <queueSize>8192</queueSize>
-    <neverBlock>true</neverBlock>
+        <appender-ref ref="APP_FILE"/>
+        <discardingThreshold>0</discardingThreshold>
+        <queueSize>8192</queueSize>
+        <neverBlock>true</neverBlock>
+    </appender>
+
+    <!-- access 로그(JSON) -->
+    <appender name="ACCESS_JSON" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_DIR}/access.json.log</file>
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder"/>
+        <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_DIR}/archive/%d{yyyy-MM}/access.%d{yyyy-MM-dd}.%i.json.gz</fileNamePattern>
+            <maxHistory>14</maxHistory>
+            <totalSizeCap>4GB</totalSizeCap>
+            <timeBasedFileNamingAndTriggeringPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedFNATP">
+            <maxFileSize>200MB</maxFileSize>
+            </timeBasedFileNamingAndTriggeringPolicy>
+        </rollingPolicy>
     </appender>
 
     <!-- 루트 로거 -->
     <root level="INFO">
-    <appender-ref ref="CONSOLE"/>
-    <appender-ref ref="ASYNC_APP_FILE"/>
+        <appender-ref ref="CONSOLE"/>
+        <appender-ref ref="ASYNC_APP_FILE"/>
     </root>
+
+    <!-- access 전용 로거 -->
+    <logger name="access" level="INFO" additivity="false">
+        <appender-ref ref="ACCESS_JSON"/>
+    </logger>
 
     <!-- 필요 시 패키지별 레벨 조정 -->
     <logger name="io.netty" level="WARN"/>
