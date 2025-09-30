@@ -20,9 +20,14 @@ public final class Config {
     public final int maxContentLength;
     public final Long requestMinGapMs;
 
+    public final String hmacSecret; // nullable
+    public final long hmacClockSkewSec; // default 60
+    public final long nonceTtlSec; // default 180
+
     private Config(int port, double capacity, double refillPerSec, long idleEvictMs,
             double defaultRequestCost, String[] identityOrder,
-            int bossThreads, int workerThreads, int maxContentLength, Long requestMinGapMs) {
+            int bossThreads, int workerThreads, int maxContentLength, Long requestMinGapMs,
+            String hmacSecret, long hmacClockSkewSec, long nonceTtlSec) {
         this.port = port;
         this.capacity = capacity;
         this.refillPerSec = refillPerSec;
@@ -33,11 +38,17 @@ public final class Config {
         this.workerThreads = workerThreads;
         this.maxContentLength = maxContentLength;
         this.requestMinGapMs = requestMinGapMs;
+        this.hmacSecret = (hmacSecret == null || hmacSecret.trim().isEmpty()) ? null : hmacSecret;
+        this.hmacClockSkewSec = hmacClockSkewSec <= 0 ? 60 : hmacClockSkewSec;
+        this.nonceTtlSec = nonceTtlSec <= 0 ? 180 : nonceTtlSec;
+
         log.info(
                 "Config: port={}, capacity={}, refill/s={}, idleEvictMs={}, defaultCost={}, " +
-                        "idOrder={}, bossThreads={}, workerThreads={}, maxContentLength={}, requestMinGapMs={}",
+                        "idOrder={}, bossThreads={}, workerThreads={}, maxContentLength={}, requestMinGapMs={}, " +
+                        "hmacSecret={}, hmacClockSkewSec={}, nonceTtlSec={}",
                 port, capacity, refillPerSec, idleEvictMs, defaultRequestCost,
-                String.join(",", identityOrder), bossThreads, workerThreads, maxContentLength, requestMinGapMs);
+                String.join(",", identityOrder), bossThreads, workerThreads, maxContentLength, requestMinGapMs,
+                hmacSecret, hmacClockSkewSec, nonceTtlSec);
     }
 
     public static Config load(String path) throws IOException {
@@ -56,6 +67,9 @@ public final class Config {
         int boss = Integer.parseInt(p.getProperty("server.boss_threads", "1"));
         int worker = Integer.parseInt(p.getProperty("server.worker_threads", "0"));
         int maxLen = Integer.parseInt(p.getProperty("http.max_content_length", "1048576"));
+        String hmacSecret = p.getProperty("auth.hmac_secret", "").trim();
+        long hmacClockSkewSec = Long.parseLong(p.getProperty("auth.hmac_clock_skew_sec", "60"));
+        long nonceTtlSec = Long.parseLong(p.getProperty("auth.nonce_ttl_sec", "180"));
 
         Long reqMinGap = null;
         if (!mg.isEmpty()) {
@@ -70,6 +84,7 @@ public final class Config {
             }
         }
 
-        return new Config(port, cap, rps, idle, defCost, order, boss, worker, maxLen, reqMinGap);
+        return new Config(port, cap, rps, idle, defCost, order, boss, worker, maxLen, reqMinGap,
+                hmacSecret, hmacClockSkewSec, nonceTtlSec);
     }
 }

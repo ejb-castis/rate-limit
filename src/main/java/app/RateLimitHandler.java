@@ -26,6 +26,7 @@ import io.prometheus.client.exporter.common.TextFormat;
 public final class RateLimitHandler extends SimpleChannelInboundHandler<FullHttpRequest> {
     private static final Logger log = LoggerFactory.getLogger(RateLimitHandler.class);
     private static final Logger access = LoggerFactory.getLogger("access");
+    private static final Logger accessDecide = LoggerFactory.getLogger("access_decide");
 
     // === Prometheus metrics ===
     private static final Counter REQUESTS = Counter.build()
@@ -42,6 +43,32 @@ public final class RateLimitHandler extends SimpleChannelInboundHandler<FullHttp
             .name("rl_request_latency_seconds").help("Request latency")
             .labelNames("method", "rule", "outcome")
             .buckets(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0).register();
+
+    // === Decide-specific Prometheus metrics (with service/server labels) ===
+    private static final Counter DECIDE_REQUESTS = Counter.build()
+            .name("rl_decide_requests_total")
+            .help("Total /decide requests")
+            .labelNames("svc", "server", "rule", "outcome", "status_class")
+            .register();
+
+    private static final Counter DECIDE_RATE_LIMIT_429 = Counter.build()
+            .name("rl_decide_rate_limit_429_total")
+            .help("429 via token-bucket on /decide")
+            .labelNames("svc", "rule")
+            .register();
+
+    private static final Counter DECIDE_MIN_GAP_429 = Counter.build()
+            .name("rl_decide_min_gap_429_total")
+            .help("429 via min-gap on /decide")
+            .labelNames("svc", "rule")
+            .register();
+
+    private static final Histogram DECIDE_LATENCY = Histogram.build()
+            .name("rl_decide_latency_seconds")
+            .help("/decide request latency")
+            .labelNames("svc", "server", "rule", "outcome")
+            .buckets(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0)
+            .register();
 
     static {
         DefaultExports.initialize();
@@ -63,20 +90,229 @@ public final class RateLimitHandler extends SimpleChannelInboundHandler<FullHttp
     private final RouteRules rules;
     private final UserBuckets store;
     private final MinGapGate minGapGate;
+    private final AuthVerifier auth;
 
     public RateLimitHandler(Config cfg, RouteRules rules, UserBuckets store, MinGapGate minGapGate) {
         this.cfg = cfg;
         this.rules = rules;
         this.store = store;
         this.minGapGate = minGapGate;
+        this.auth = new AuthVerifier(cfg.hmacSecret, cfg.hmacClockSkewSec, cfg.nonceTtlSec);
+    }
+
+    // === Refactor helpers ===
+    private enum Outcome {
+        PASS, MIN_GAP, RATE_LIMIT, ERROR
+    }
+
+    private static final class EvalResult {
+        String method;
+        String path;
+        String user;
+        String ruleId;
+        double capacity;
+        double refill;
+        double cost;
+        double remaining; // -1 when blocked
+        Outcome outcome; // PASS / MIN_GAP / RATE_LIMIT / ERROR
+        int status; // 2xx/4xx etc
+        Long retryAfterSec; // for 429
+        Long minGapRemainMs; // for 429 min-gap
+        long latencyMs; // computed on finalize
+    }
+
+    /** Compute effective rule parameters and evaluate min-gap + token bucket. */
+    private EvalResult evaluate(String method, String realPath, String userKey, Double costOverride,
+            RouteRule rule, long startNs) {
+        EvalResult r = new EvalResult();
+        r.method = method;
+        r.path = realPath;
+        r.user = userKey;
+        r.ruleId = (rule != null ? rule.id : "default");
+
+        r.capacity = (rule != null && rule.capacityOverride != null) ? rule.capacityOverride : cfg.capacity;
+        r.refill = (rule != null && rule.refillPerSecOverride != null) ? rule.refillPerSecOverride : cfg.refillPerSec;
+        r.cost = (costOverride != null) ? costOverride
+                : (rule != null && rule.costOrNull != null ? rule.costOrNull : cfg.defaultRequestCost);
+
+        // 1) min-gap (route > global)
+        Long effMinGap = null;
+        if (rule != null && rule.minGapMs != null && rule.minGapMs > 0)
+            effMinGap = rule.minGapMs;
+        else if (cfg.requestMinGapMs != null && cfg.requestMinGapMs > 0)
+            effMinGap = cfg.requestMinGapMs;
+
+        if (effMinGap != null) {
+            long now = System.currentTimeMillis();
+            long remainMs = minGapGate.check(bucketKey(userKey, r.ruleId), now, effMinGap);
+            if (remainMs > 0) {
+                r.outcome = Outcome.MIN_GAP;
+                r.status = 429;
+                r.minGapRemainMs = remainMs;
+                r.retryAfterSec = (long) Math.ceil(remainMs / 1000.0);
+                r.remaining = -1.0;
+                r.latencyMs = (System.nanoTime() - startNs) / 1_000_000L;
+                return r;
+            }
+        }
+
+        // 2) token bucket
+        TokenBucket bucket = store.getWithOverrides(bucketKey(userKey, r.ruleId), r.capacity, r.refill);
+        double remaining = bucket.tryConsume(r.cost, System.nanoTime());
+        if (remaining < 0) {
+            r.outcome = Outcome.RATE_LIMIT;
+            r.status = 429;
+            r.remaining = -1.0;
+            r.retryAfterSec = (long) Math.ceil(r.cost / bucket.getRefillPerSec());
+            r.latencyMs = (System.nanoTime() - startNs) / 1_000_000L;
+            return r;
+        }
+
+        // 3) pass
+        r.outcome = Outcome.PASS;
+        r.status = 200; // for JSON path; decide path will map to 204 later
+        r.remaining = remaining;
+        r.latencyMs = (System.nanoTime() - startNs) / 1_000_000L;
+        return r;
+    }
+
+    /** Record Prometheus metrics for the decision. */
+    private void recordMetrics(EvalResult r, boolean isDecide) {
+        String outcomeLabel;
+        int statusForClass;
+        switch (r.outcome) {
+            case MIN_GAP:
+                outcomeLabel = "min_gap";
+                statusForClass = 429;
+                MIN_GAP_429.labels(r.ruleId).inc();
+                break;
+            case RATE_LIMIT:
+                outcomeLabel = "rate_limit";
+                statusForClass = 429;
+                RATE_LIMIT_429.labels(r.ruleId).inc();
+                break;
+            case ERROR:
+                outcomeLabel = "error";
+                statusForClass = r.status <= 0 ? 500 : r.status;
+                break;
+            default:
+                outcomeLabel = "pass";
+                statusForClass = isDecide ? 204 : 200;
+        }
+        REQUESTS.labels(r.method, r.ruleId, outcomeLabel, statusClass(statusForClass)).inc();
+        LATENCY.labels(r.method, r.ruleId, outcomeLabel).observe(r.latencyMs / 1000.0);
+    }
+
+    private void recordDecideMetrics(EvalResult r, String svc, String serverKey) {
+        String outcomeLabel;
+        int statusForClass;
+        switch (r.outcome) {
+            case MIN_GAP:
+                outcomeLabel = "min_gap";
+                statusForClass = 429;
+                DECIDE_MIN_GAP_429.labels(svc, r.ruleId).inc();
+                break;
+            case RATE_LIMIT:
+                outcomeLabel = "rate_limit";
+                statusForClass = 429;
+                DECIDE_RATE_LIMIT_429.labels(svc, r.ruleId).inc();
+                break;
+            case ERROR:
+                outcomeLabel = "error";
+                statusForClass = r.status <= 0 ? 500 : r.status;
+                break;
+            default:
+                outcomeLabel = "pass";
+                statusForClass = 204;
+        }
+        DECIDE_REQUESTS.labels(svc, serverKey, r.ruleId, outcomeLabel, statusClass(statusForClass)).inc();
+        DECIDE_LATENCY.labels(svc, serverKey, r.ruleId, outcomeLabel).observe(r.latencyMs / 1000.0);
+    }
+
+    /** Write access log in one place. */
+    private void logDecision(ChannelHandlerContext ctx, FullHttpRequest req, EvalResult r,
+            boolean isDecide, String svc, String serverKey) {
+        String outcomeLabel = (r.outcome == Outcome.MIN_GAP) ? "min_gap"
+                : (r.outcome == Outcome.RATE_LIMIT) ? "rate_limit" : (r.outcome == Outcome.ERROR) ? "error" : "pass";
+        int statusForLog = (r.outcome == Outcome.PASS ? (r.status == 200 ? 200 : r.status) : r.status);
+
+        String clientIp = null;
+        String xff = req.headers().get("X-Forwarded-For");
+        if (xff != null && !xff.isEmpty())
+            clientIp = xff.split(",")[0].trim();
+        if (clientIp == null || clientIp.isEmpty()) {
+            InetSocketAddress remote = (InetSocketAddress) ctx.channel().remoteAddress();
+            clientIp = remote.getAddress().getHostAddress();
+        }
+        String ua = Optional.ofNullable(req.headers().get("User-Agent")).orElse("");
+        String origin = Optional.ofNullable(req.headers().get("Origin")).orElse("");
+        String referer = Optional.ofNullable(req.headers().get("Referer")).orElse("");
+
+        Logger target = isDecide ? accessDecide : access;
+        String svcVal = isDecide ? (svc == null ? "-" : svc) : "-";
+        String srvVal = isDecide ? (serverKey == null ? "-" : serverKey) : "-";
+
+        target.info(
+                "svc={} server={} method={} path={} user={} rule={} outcome={} status={} latency_ms={} cost={} remaining={} capacity={} "
+                        + "refill_per_sec={} ip={} ua=\"{}\" origin=\"{}\" referer=\"{}\"",
+                svcVal, srvVal,
+                r.method, r.path, r.user, r.ruleId, outcomeLabel, statusForLog, r.latencyMs,
+                String.format(java.util.Locale.US, "%.2f", r.cost),
+                String.format(java.util.Locale.US, "%.2f", r.remaining),
+                String.format(java.util.Locale.US, "%.2f", r.capacity),
+                String.format(java.util.Locale.US, "%.2f", r.refill),
+                clientIp, ua, origin, referer);
+    }
+
+    /** Build JSON body for the normal JSON API. */
+    private String buildJson(EvalResult r) {
+        if (r.outcome == Outcome.PASS) {
+            return "{" +
+                    "\"ok\":true," +
+                    "\"user\":\"" + esc(r.user) + "\"," +
+                    "\"method\":\"" + esc(r.method) + "\"," +
+                    "\"path\":\"" + esc(r.path) + "\"," +
+                    "\"ruleId\":\"" + esc(r.ruleId) + "\"," +
+                    "\"capacity\":" + r.capacity + "," +
+                    "\"refillPerSec\":" + r.refill + "," +
+                    "\"cost\":" + r.cost + "," +
+                    "\"remaining\":" + String.format(java.util.Locale.US, "%.2f", r.remaining) +
+                    "}";
+        }
+        String err = (r.outcome == Outcome.MIN_GAP) ? "min_gap"
+                : (r.outcome == Outcome.RATE_LIMIT) ? "rate_limit_exceeded" : "error";
+        return "{" +
+                "\"error\":\"" + err + "\"," +
+                "\"user\":\"" + esc(r.user) + "\"" +
+                "}";
+    }
+
+    /** Respond for /decide (headers only). */
+    private void respondDecide(ChannelHandlerContext ctx, EvalResult r) {
+        if (r.outcome == Outcome.PASS) {
+            DefaultFullHttpResponse ok = new DefaultFullHttpResponse(HTTP_1_1, NO_CONTENT);
+            HttpHeaders h = ok.headers();
+            h.set("X-Rate-Remaining", String.format(java.util.Locale.US, "%.2f", r.remaining));
+            h.set("X-Rate-Capacity", String.format(java.util.Locale.US, "%.2f", r.capacity));
+            h.set("X-Rate-Refill-PerSec", String.format(java.util.Locale.US, "%.2f", r.refill));
+            h.set("X-Rate-RuleId", r.ruleId);
+            h.set("X-Rate-Cost-Used", String.format(java.util.Locale.US, "%.2f", r.cost));
+            ctx.writeAndFlush(ok);
+            return;
+        }
+        DefaultFullHttpResponse too = new DefaultFullHttpResponse(HTTP_1_1, TOO_MANY_REQUESTS);
+        HttpHeaders h = too.headers();
+        if (r.retryAfterSec != null)
+            h.set("Retry-After", String.valueOf(r.retryAfterSec));
+        if (r.minGapRemainMs != null)
+            h.set("X-MinGap-Remaining-Millis", String.valueOf(r.minGapRemainMs));
+        h.set("X-Rate-RuleId", r.ruleId);
+        ctx.writeAndFlush(too);
     }
 
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, FullHttpRequest req) {
         final long startNs = System.nanoTime();
-        String ruleForMetrics = "default";
-        String outcomeForMetrics = "pass"; // pass|min_gap|rate_limit|error
-        int statusForMetrics = 200;
 
         final String method = req.method().name();
         final String path = req.uri().split("\\?", 2)[0];
@@ -96,10 +332,14 @@ public final class RateLimitHandler extends SimpleChannelInboundHandler<FullHttp
             }
             return;
         }
+        if (path.equals("/decide")) {
+            handleDecide(ctx, req);
+            return;
+        }
+
         Optional<RouteRule> matched = rules.firstMatch(method, path);
         if (matched.isPresent()) {
             RouteRule rule = matched.get();
-            ruleForMetrics = rule.id;
 
             String userKey = resolveUserKey(ctx, req);
             MDC.put("method", method);
@@ -113,161 +353,51 @@ public final class RateLimitHandler extends SimpleChannelInboundHandler<FullHttp
                 return;
             }
 
-            double cost = (rule.costOrNull != null) ? rule.costOrNull : cfg.defaultRequestCost;
-            double capacity = (rule.capacityOverride != null) ? rule.capacityOverride : cfg.capacity;
-            double refill = (rule.refillPerSecOverride != null) ? rule.refillPerSecOverride : cfg.refillPerSec;
+            EvalResult r = evaluate(method, path, userKey, null, rule, startNs);
+            recordMetrics(r, false);
+            logDecision(ctx, req, r, false, null, null);
 
-            // ✅ 1) 최소 간격 검사: 통과하지 못하면 토큰은 소모하지 않음
-            Long effMinGap = (rule.minGapMs != null && rule.minGapMs > 0)
-                    ? rule.minGapMs
-                    : (cfg.requestMinGapMs != null && cfg.requestMinGapMs > 0)
-                            ? cfg.requestMinGapMs
-                            : null;
-
-            if (effMinGap != null) {
-                long now = System.currentTimeMillis();
-                long remainMs = minGapGate.check(bucketKey(userKey, rule.id), now, effMinGap);
-                if (remainMs > 0) {
-                    outcomeForMetrics = "min_gap";
-                    statusForMetrics = 429;
-                    MIN_GAP_429.labels(rule.id).inc();
-                    REQUESTS.labels(method, ruleForMetrics, outcomeForMetrics, statusClass(statusForMetrics)).inc();
-                    LATENCY.labels(method, ruleForMetrics, outcomeForMetrics)
-                            .observe((System.nanoTime() - startNs) / 1_000_000_000.0);
-
-                    logAccess(ctx, method, path, userKey, rule.id, outcomeForMetrics, statusForMetrics, cost, -1.0,
-                            capacity,
-                            refill,
-                            (System.nanoTime() - startNs) / 1_000_000L, req);
-
-                    // 429 + Retry-After (초) + 남은 ms 헤더
-                    Map<String, String> extra = new HashMap<>();
-                    long retrySec = (long) Math.ceil(remainMs / 1000.0);
-                    extra.put("Retry-After", String.valueOf(retrySec));
-                    extra.put("X-MinGap-Remaining-Millis", String.valueOf(remainMs));
-                    writeJson(ctx, TOO_MANY_REQUESTS,
-                            "{\"error\":\"min_gap\",\"user\":\"" + esc(userKey) + "\"}", extra);
-
-                    log.info("MIN-GAP block user={} rule={} path={} remainMs={}",
-                            userKey, rule.id, path, remainMs);
-                    MDC.clear();
-                    return;
-                }
-            }
-
-            // ✅ 2) 토큰 버킷 검사/소모
-            TokenBucket bucket = store.getWithOverrides(bucketKey(userKey, rule.id), capacity, refill);
-            double remaining = bucket.tryConsume(cost, System.nanoTime());
-            if (remaining < 0) {
-                outcomeForMetrics = "rate_limit";
-                statusForMetrics = 429;
-                RATE_LIMIT_429.labels(rule.id).inc();
-                REQUESTS.labels(method, ruleForMetrics, outcomeForMetrics, statusClass(statusForMetrics)).inc();
-                LATENCY.labels(method, ruleForMetrics, outcomeForMetrics)
-                        .observe((System.nanoTime() - startNs) / 1_000_000_000.0);
-                logAccess(ctx, method, path, userKey, rule.id, outcomeForMetrics, statusForMetrics, cost, -1.0,
-                        capacity, refill,
-                        (System.nanoTime() - startNs) / 1_000_000L, req);
-
-                long wait = (long) Math.ceil(cost / bucket.getRefillPerSec());
+            if (r.outcome == Outcome.MIN_GAP) {
                 Map<String, String> extra = new HashMap<>();
-                extra.put("Retry-After", String.valueOf(wait));
-                writeJson(ctx, TOO_MANY_REQUESTS,
-                        "{\"error\":\"rate_limit_exceeded\",\"user\":\"" + esc(userKey) + "\"}", extra);
-
-                log.info("RATELIMIT block user={} rule={} path={} cost={} wait={}",
-                        userKey, rule.id, path, cost, wait);
+                extra.put("Retry-After", String.valueOf(r.retryAfterSec));
+                extra.put("X-MinGap-Remaining-Millis", String.valueOf(r.minGapRemainMs));
+                writeJson(ctx, TOO_MANY_REQUESTS, buildJson(r), extra);
+                MDC.clear();
+                return;
+            }
+            if (r.outcome == Outcome.RATE_LIMIT) {
+                Map<String, String> extra = new HashMap<>();
+                extra.put("Retry-After", String.valueOf(r.retryAfterSec));
+                writeJson(ctx, TOO_MANY_REQUESTS, buildJson(r), extra);
                 MDC.clear();
                 return;
             }
 
-            String json = "{"
-                    + "\"ok\":true,"
-                    + "\"user\":\"" + esc(userKey) + "\","
-                    + "\"method\":\"" + esc(method) + "\","
-                    + "\"path\":\"" + esc(path) + "\","
-                    + "\"ruleId\":\"" + rule.id + "\","
-                    + "\"capacity\":" + capacity + ","
-                    + "\"refillPerSec\":" + refill + ","
-                    + "\"cost\":" + cost + ","
-                    + "\"remaining\":" + String.format(java.util.Locale.US, "%.2f", remaining)
-                    + "}";
-            outcomeForMetrics = "pass";
-            statusForMetrics = 200;
-            REQUESTS.labels(method, ruleForMetrics, outcomeForMetrics, statusClass(statusForMetrics)).inc();
-            LATENCY.labels(method, ruleForMetrics, outcomeForMetrics)
-                    .observe((System.nanoTime() - startNs) / 1_000_000_000.0);
-            logAccess(ctx, method, path, userKey, rule.id, outcomeForMetrics, statusForMetrics, cost, remaining,
-                    capacity, refill,
-                    (System.nanoTime() - startNs) / 1_000_000L, req);
-
-            writeJson(ctx, OK, json, null);
+            writeJson(ctx, OK, buildJson(r), null);
             if (log.isDebugEnabled()) {
-                log.debug("PASS user={} rule={} path={} remaining={}",
-                        userKey, rule.id, path, remaining);
+                log.debug("PASS user={} rule={} path={} remaining={}", r.user, r.ruleId, r.path, r.remaining);
             }
             MDC.clear();
             return;
         }
 
-        // 규칙 없음: 전역 버킷만 적용(간격 제한(mingap) 없음)
+        // No rule (default)
         String userKey = resolveUserKey(ctx, req);
-        outcomeForMetrics = "pass";
-        statusForMetrics = 200;
-        REQUESTS.labels(method, ruleForMetrics, outcomeForMetrics, statusClass(statusForMetrics)).inc();
-        LATENCY.labels(method, ruleForMetrics, outcomeForMetrics)
-                .observe((System.nanoTime() - startNs) / 1_000_000_000.0);
+        EvalResult r = evaluate(method, path, userKey, null, null, startNs);
+        recordMetrics(r, false);
+        logDecision(ctx, req, r, false, null, null);
 
-        TokenBucket bucket = store.getWithOverrides(bucketKey(userKey, "default"), cfg.capacity, cfg.refillPerSec);
-        double remaining = bucket.tryConsume(cfg.defaultRequestCost, System.nanoTime());
-        if (remaining < 0) {
-            outcomeForMetrics = "rate_limit";
-            statusForMetrics = 429;
-            RATE_LIMIT_429.labels("default").inc();
-            REQUESTS.labels(method, ruleForMetrics, outcomeForMetrics, statusClass(statusForMetrics)).inc();
-            LATENCY.labels(method, ruleForMetrics, outcomeForMetrics)
-                    .observe((System.nanoTime() - startNs) / 1_000_000_000.0);
-            logAccess(ctx, method, path, userKey, "default", outcomeForMetrics, statusForMetrics,
-                    cfg.defaultRequestCost, -1.0,
-                    cfg.capacity, cfg.refillPerSec, (System.nanoTime() - startNs) / 1_000_000L, req);
-
-            long wait = (long) Math.ceil(cfg.defaultRequestCost / bucket.getRefillPerSec());
+        if (r.outcome == Outcome.RATE_LIMIT) {
             Map<String, String> extra = new HashMap<>();
-            extra.put("Retry-After", String.valueOf(wait));
-            writeJson(ctx, TOO_MANY_REQUESTS,
-                    "{\"error\":\"rate_limit_exceeded\",\"user\":\"" + esc(userKey) + "\"}", extra);
-
-            log.info("RATELIMIT block user={} rule=default path={} cost={} wait={}",
-                    userKey, path, cfg.defaultRequestCost, wait);
-            MDC.clear();
+            extra.put("Retry-After", String.valueOf(r.retryAfterSec));
+            writeJson(ctx, TOO_MANY_REQUESTS, buildJson(r), extra);
             return;
         }
-        String json = "{"
-                + "\"ok\":true,"
-                + "\"user\":\"" + esc(userKey) + "\","
-                + "\"method\":\"" + esc(method) + "\","
-                + "\"path\":\"" + esc(path) + "\","
-                + "\"ruleId\":\"default\","
-                + "\"capacity\":" + cfg.capacity + ","
-                + "\"refillPerSec\":" + cfg.refillPerSec + ","
-                + "\"cost\":" + cfg.defaultRequestCost + ","
-                + "\"remaining\":" + String.format(java.util.Locale.US, "%.2f", remaining)
-                + "}";
-        outcomeForMetrics = "pass";
-        statusForMetrics = 200;
-        REQUESTS.labels(method, ruleForMetrics, outcomeForMetrics, statusClass(statusForMetrics)).inc();
-        LATENCY.labels(method, ruleForMetrics, outcomeForMetrics)
-                .observe((System.nanoTime() - startNs) / 1_000_000_000.0);
-        logAccess(ctx, method, path, userKey, "default", outcomeForMetrics, statusForMetrics, cfg.defaultRequestCost,
-                remaining,
-                cfg.capacity, cfg.refillPerSec, (System.nanoTime() - startNs) / 1_000_000L, req);
 
-        writeJson(ctx, OK, json, null);
+        writeJson(ctx, OK, buildJson(r), null);
         if (log.isDebugEnabled()) {
-            log.debug("PASS user={} rule=default path={} remaining={}",
-                    userKey, path, remaining);
+            log.debug("PASS user={} rule=default path={} remaining={}", r.user, r.path, r.remaining);
         }
-        MDC.clear();
     }
 
     private static String bucketKey(String userKey, String ruleId) {
@@ -351,31 +481,74 @@ public final class RateLimitHandler extends SimpleChannelInboundHandler<FullHttp
         ctx.writeAndFlush(resp).addListener(ChannelFutureListener.CLOSE);
     }
 
-    private void logAccess(ChannelHandlerContext ctx, String method, String path, String user, String ruleId,
-            String outcome, int status,
-            double cost, double remaining, double capacity, double refillPerSec,
-            long latencyMs, FullHttpRequest req) {
-        String clientIp = null;
-        String xff = req.headers().get("X-Forwarded-For");
-        if (xff != null && !xff.isEmpty()) {
-            clientIp = xff.split(",")[0].trim();
-        }
-        if (clientIp == null || clientIp.isEmpty()) {
-            InetSocketAddress remote = (InetSocketAddress) ctx.channel().remoteAddress();
-            clientIp = remote.getAddress().getHostAddress();
-        }
-        String ua = Optional.ofNullable(req.headers().get("User-Agent")).orElse("");
-        String origin = Optional.ofNullable(req.headers().get("Origin")).orElse("");
-        String referer = Optional.ofNullable(req.headers().get("Referer")).orElse("");
+    private void handleDecide(ChannelHandlerContext ctx, FullHttpRequest req) {
+        final long startNs = System.nanoTime();
 
-        access.info(
-                "method={} path={} user={} rule={} outcome={} status={} latency_ms={} cost={} remaining={} capacity={} "
-                        + "refill_per_sec={} ip={} ua=\"{}\" origin=\"{}\" referer=\"{}\"",
-                method, path, user, ruleId, outcome, status, latencyMs,
-                String.format(java.util.Locale.US, "%.2f", cost),
-                String.format(java.util.Locale.US, "%.2f", remaining),
-                String.format(java.util.Locale.US, "%.2f", capacity),
-                String.format(java.util.Locale.US, "%.2f", refillPerSec),
-                clientIp, ua, origin, referer);
+        String full = req.uri();
+        String realPath = extractQueryParam(full, "path");
+        if (realPath == null)
+            realPath = "/";
+
+        String userKey = resolveUserKey(ctx, req);
+        String costHdr = req.headers().get("X-Rate-Cost");
+        Double costOverride = null;
+        if (costHdr != null) {
+            try {
+                costOverride = Double.parseDouble(costHdr);
+            } catch (Exception ignored) {
+            }
+        }
+        String svc = Optional.ofNullable(req.headers().get("X-Service-Id")).orElse("unknown");
+        String serverKey = Optional.ofNullable(req.headers().get("X-Service-Key")).orElse("unknown");
+
+        // HMAC (optional)
+        if (!auth.verify(req, "GET", realPath, userKey, costHdr)) {
+            EvalResult err = new EvalResult();
+            err.method = "GET";
+            err.path = realPath;
+            err.user = userKey;
+            err.ruleId = "default";
+            err.outcome = Outcome.ERROR;
+            err.status = 403;
+            err.latencyMs = (System.nanoTime() - startNs) / 1_000_000L;
+            recordDecideMetrics(err, svc, serverKey);
+            logDecision(ctx, req, err, false, svc, serverKey);
+            writeStatus(ctx, FORBIDDEN);
+            return;
+        }
+
+        Optional<RouteRule> matched = rules.firstMatch("GET", realPath);
+        RouteRule rule = matched.orElse(null);
+
+        EvalResult r = evaluate("GET", realPath, userKey, costOverride, rule, startNs);
+        recordDecideMetrics(r, svc, serverKey);
+        logDecision(ctx, req, r, true, svc, serverKey);
+        respondDecide(ctx, r);
+    }
+
+    private static String extractQueryParam(String rawUri, String key) {
+        String[] parts = rawUri.split("\\?", 2);
+        if (parts.length < 2)
+            return null;
+        String q = parts[1];
+        for (String kv : q.split("&")) {
+            int i = kv.indexOf('=');
+            if (i <= 0)
+                continue;
+            String k = kv.substring(0, i);
+            String v = kv.substring(i + 1);
+            if (k.equals(key)) {
+                try {
+                    return java.net.URLDecoder.decode(v, java.nio.charset.StandardCharsets.UTF_8.name());
+                } catch (Exception ignored) {
+                }
+            }
+        }
+        return null;
+    }
+
+    private static void writeStatus(ChannelHandlerContext ctx, HttpResponseStatus status) {
+        DefaultFullHttpResponse r = new DefaultFullHttpResponse(HTTP_1_1, status);
+        ctx.writeAndFlush(r);
     }
 }

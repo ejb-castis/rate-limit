@@ -59,6 +59,20 @@
         </rollingPolicy>
     </appender>
 
+    <!-- /decide 전용 access 로그 -->
+    <appender name="ACCESS_DECIDE_JSON" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_DIR}/access_decide.json.log</file>
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder"/>
+        <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_DIR}/archive/%d{yyyy-MM}/access_decide.%d{yyyy-MM-dd}.%i.json.gz</fileNamePattern>
+            <maxHistory>14</maxHistory>
+            <totalSizeCap>4GB</totalSizeCap>
+            <timeBasedFileNamingAndTriggeringPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedFNATP">
+            <maxFileSize>200MB</maxFileSize>
+            </timeBasedFileNamingAndTriggeringPolicy>
+        </rollingPolicy>
+    </appender>
+
     <!-- 루트 로거 -->
     <root level="INFO">
         <appender-ref ref="CONSOLE"/>
@@ -69,6 +83,11 @@
     <logger name="access" level="INFO" additivity="false">
         <appender-ref ref="ACCESS_JSON"/>
     </logger>
+
+    <!-- access decide 전용 로거 -->
+    <logger name="access_decide" level="INFO" additivity="false">
+        <appender-ref ref="ACCESS_DECIDE_JSON"/>
+    </logger>    
 
     <!-- 필요 시 패키지별 레벨 조정 -->
     <logger name="io.netty" level="WARN"/>

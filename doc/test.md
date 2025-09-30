@@ -50,3 +50,22 @@ alice라는 유저로 300번의 API 요청을 동시에(최대 20개 병렬) 보
 
 - 결과(HTTP 상태코드들)를 정렬하고, 각 코드별로 몇 번 나왔는지 개수 집계
 
+## decide api test
+```shell
+# 허용 케이스
+curl -i -H 'X-User-Id: alice' 'http://localhost:18089/decide?path=/api/typeahead'
+# 204 No Content
+# X-Rate-Remaining: ...
+# X-Rate-RuleId: r2@L5
+
+# min-gap 차단
+curl -i -H 'X-User-Id: alice' 'http://localhost:18089/decide?path=/api/typeahead'
+curl -i -H 'X-User-Id: alice' 'http://localhost:18089/decide?path=/api%/typeahead'  # 180ms 내 재요청 → 429
+# 429 Too Many Requests
+# Retry-After: 1
+# X-MinGap-Remaining-Millis: 137
+
+# 토큰 버킷 차단 (capacity/refill 낮추고 병렬 다건)
+seq 20 | xargs -n1 -P20 -I{} curl -s -o /dev/null -w '%{http_code}\n' -H 'X-User-Id: alice' \
+  'http://localhost:18089/decide?path=/api/v1/heavy' | sort | uniq -c
+```
