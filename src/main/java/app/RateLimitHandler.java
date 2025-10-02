@@ -500,8 +500,8 @@ public final class RateLimitHandler extends SimpleChannelInboundHandler<FullHttp
             } catch (Exception ignored) {
             }
         }
-        String svc = Optional.ofNullable(req.headers().get("X-Service-Id")).orElse("unknown");
-        String serverKey = Optional.ofNullable(req.headers().get("X-Service-Key")).orElse("unknown");
+        String svc = Optional.ofNullable(req.headers().get("X-Service-Key")).orElse("unknown");
+        String serverKey = Optional.ofNullable(req.headers().get("X-Server-Key")).orElse("unknown");
 
         // HMAC (optional)
         if (!auth.verify(req, "GET", realPath, userKey, costHdr)) {

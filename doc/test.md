@@ -52,7 +52,13 @@ alice라는 유저로 300번의 API 요청을 동시에(최대 20개 병렬) 보
 
 ## decide api test
 ```shell
-# 허용 케이스
+
+curl -i \
+  -H 'X-User-Id: alice' \
+  -H 'X-Service-Key: test-service' \
+  -H 'X-Server-Key: test-server' \
+  'http://localhost:18089/decide?path=/api/v1/heavy'
+
 curl -i -H 'X-User-Id: alice' 'http://localhost:18089/decide?path=/api/typeahead'
 # 204 No Content
 # X-Rate-Remaining: ...
