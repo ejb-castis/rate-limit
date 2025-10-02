@@ -297,7 +297,8 @@ public final class RateLimitHandler extends SimpleChannelInboundHandler<FullHttp
             h.set("X-Rate-Refill-PerSec", String.format(java.util.Locale.US, "%.2f", r.refill));
             h.set("X-Rate-RuleId", r.ruleId);
             h.set("X-Rate-Cost-Used", String.format(java.util.Locale.US, "%.2f", r.cost));
-            ctx.writeAndFlush(ok);
+            h.setInt(HttpHeaderNames.CONTENT_LENGTH, 0);
+            ctx.writeAndFlush(ok).addListener(ChannelFutureListener.CLOSE);
             return;
         }
         DefaultFullHttpResponse too = new DefaultFullHttpResponse(HTTP_1_1, TOO_MANY_REQUESTS);
@@ -307,7 +308,8 @@ public final class RateLimitHandler extends SimpleChannelInboundHandler<FullHttp
         if (r.minGapRemainMs != null)
             h.set("X-MinGap-Remaining-Millis", String.valueOf(r.minGapRemainMs));
         h.set("X-Rate-RuleId", r.ruleId);
-        ctx.writeAndFlush(too);
+        h.setInt(HttpHeaderNames.CONTENT_LENGTH, 0);
+        ctx.writeAndFlush(too).addListener(ChannelFutureListener.CLOSE);
     }
 
     @Override
@@ -512,7 +514,7 @@ public final class RateLimitHandler extends SimpleChannelInboundHandler<FullHttp
             err.status = 403;
             err.latencyMs = (System.nanoTime() - startNs) / 1_000_000L;
             recordDecideMetrics(err, svc, serverKey);
-            logDecision(ctx, req, err, false, svc, serverKey);
+            logDecision(ctx, req, err, true, svc, serverKey);
             writeStatus(ctx, FORBIDDEN);
             return;
         }
@@ -548,7 +550,9 @@ public final class RateLimitHandler extends SimpleChannelInboundHandler<FullHttp
     }
 
     private static void writeStatus(ChannelHandlerContext ctx, HttpResponseStatus status) {
-        DefaultFullHttpResponse r = new DefaultFullHttpResponse(HTTP_1_1, status);
-        ctx.writeAndFlush(r);
+        DefaultFullHttpResponse r = new DefaultFullHttpResponse(
+                HTTP_1_1, status, Unpooled.EMPTY_BUFFER);
+        r.headers().setInt(HttpHeaderNames.CONTENT_LENGTH, 0);
+        ctx.writeAndFlush(r).addListener(ChannelFutureListener.CLOSE);
     }
 }
