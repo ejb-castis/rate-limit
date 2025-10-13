@@ -75,3 +75,20 @@ curl -i -H 'X-User-Id: alice' 'http://localhost:18089/decide?path=/api%/typeahea
 seq 20 | xargs -n1 -P20 -I{} curl -s -o /dev/null -w '%{http_code}\n' -H 'X-User-Id: alice' \
   'http://localhost:18089/decide?path=/api/v1/heavy' | sort | uniq -c
 ```
+
+## vegeta test
+
+simple test:
+- user : 10명, cost : 1, capacity: 1000, refill_per_sec: 1000
+- -> 4000 tps 정도 
+- user : 10명, cost : 1, capacity: 100, refill_per_sec: 100 -> 3000 tps 정도
+  - 토큰 버킷 용량과 재충전 속도를 낮출 수록 tps가 떨어짐
+  - 요청 제한 할 때 사용하는 리소스가 더 많기 때문일 것이라고 추정
+- user : 10명, cost : 3, capacity: 100, refill_per_sec: 100 -> 2500 ~ 3000 tps
+  - cost 가 큰 api를 사용해도 tps 가 떨어지는 경우가 있음
+  - 요청 제한 할 때 사용하는 리소스가 더 많기 때문일 것이라고 추정
+
+- 60초 동안 300 tps 로 요청 하는 예:
+```bash
+vegeta attack -rate=300 -duration=60s -targets=tps.txt | tee out.bin | vegeta report
+```

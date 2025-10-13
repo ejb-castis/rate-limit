@@ -17,6 +17,7 @@ Thumbs.db
 # 기타
 *.swp
 *.swo
+*.bin
 
 #bin
 bin/

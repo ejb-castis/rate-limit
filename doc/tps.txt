@@ -1,0 +1,29 @@
+GET http://localhost:18089/decide?path=/api/hello
+X-User-Id: alice1
+
+GET http://localhost:18089/decide?path=/api/hello
+X-User-Id: alice2
+
+GET http://localhost:18089/decide?path=/api/hello
+X-User-Id: alice3
+
+GET http://localhost:18089/decide?path=/api/hello
+X-User-Id: alice4
+
+GET http://localhost:18089/decide?path=/api/hello
+X-User-Id: alice5
+
+GET http://localhost:18089/decide?path=/api/hello
+X-User-Id: alice6
+
+GET http://localhost:18089/decide?path=/api/hello
+X-User-Id: alice7
+
+GET http://localhost:18089/decide?path=/api/hello
+X-User-Id: alice8
+
+GET http://localhost:18089/decide?path=/api/hello
+X-User-Id: alice9
+
+GET http://localhost:18089/decide?path=/api/hello
+X-User-Id: alice10
